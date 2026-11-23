@@ -50,6 +50,7 @@ import {
   reorderPinnedThread,
   reorderActiveThread,
   setThreadAutoSettle,
+  setThreadTag,
   settleThread,
   snoozeThread,
   startThreadTurn,
@@ -262,6 +263,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     unpin: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:unpin",
       execute: unpinThread,
+      scheduler,
+      concurrency,
+    }),
+    setTag: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:set-tag",
+      execute: setThreadTag,
       scheduler,
       concurrency,
     }),
@@ -604,6 +611,17 @@ export function createThreadEnvironmentAtoms<R, E>(
       pinnedAt: null,
       pinOrderKey: null,
     })),
+    setTag: optimistic.wrap(commands.setTag, (thread, input) => {
+      const tags = thread.tags ?? [];
+      return {
+        ...thread,
+        tags: input.tagged
+          ? tags.includes(input.tag)
+            ? tags
+            : [...tags, input.tag]
+          : tags.filter((tag) => tag !== input.tag),
+      };
+    }),
     reorderPin: optimistic.wrap(commands.reorderPin, (thread, input) => ({
       ...thread,
       pinOrderKey: input.orderKey,

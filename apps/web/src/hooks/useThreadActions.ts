@@ -16,6 +16,8 @@ import {
   type ScopedThreadRef,
   ThreadId,
   sessionGrantsScope,
+  threadSectionOf,
+  threadSectionTagChanges,
 } from "@t3tools/contracts";
 import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 import * as Cause from "effect/Cause";
@@ -28,7 +30,7 @@ import { getFallbackThreadIdAfterDelete, pinOrderKeyBetween } from "../component
 import { useComposerDraftStore } from "../composerDraftStore";
 import { environmentSession, readEnvironmentScope } from "../state/session";
 import { appAtomRegistry } from "../rpc/atomRegistry";
-import { environmentServerConfigsAtom } from "../state/server";
+import { environmentServerConfigsAtom, serverEnvironment } from "../state/server";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { orchestrationEnvironment } from "../state/orchestration";
 import { projectEnvironment } from "../state/projects";
@@ -46,6 +48,7 @@ import {
   readEnvironmentSupportsAutoSettleOptOut,
   readEnvironmentThreadRefs,
   readProject,
+  readThreadSections,
   readThreadShell,
   readThreadShells,
 } from "../state/entities";
@@ -323,6 +326,12 @@ export function useThreadActions() {
     reportFailure: false,
   });
   const setThreadAutoSettleMutation = useOrchestrationCommand(threadEnvironment.setAutoSettle, {
+    reportFailure: false,
+  });
+  const setThreadTagMutation = useOrchestrationCommand(threadEnvironment.setTag, {
+    reportFailure: false,
+  });
+  const updateServerSettings = useAtomCommand(serverEnvironment.updateSettings, {
     reportFailure: false,
   });
   const reorderPinnedThreadMutation = useOrchestrationCommand(threadEnvironment.reorderPin, {
@@ -838,6 +847,105 @@ export function useThreadActions() {
     return result;
   };
 
+  const saveThreadSections = (environmentId: EnvironmentId, sections: ReadonlyArray<string>) =>
+    updateServerSettings({ environmentId, input: { patch: { threadSections: [...sections] } } });
+
+  const setThreadTags = async (
+    target: ScopedThreadRef,
+    changes: ReadonlyArray<{ readonly tag: string; readonly tagged: boolean }>,
+  ) => {
+    for (const change of changes) {
+      const result = await setThreadTagMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId, tag: change.tag, tagged: change.tagged },
+      });
+      if (result._tag === "Failure") return result;
+    }
+    return AsyncResult.success(undefined);
+  };
+
+  /** Files a thread in `section`, creating it if new, or takes it out of every section when null. */
+  const moveThreadToSection = async (target: ScopedThreadRef, section: string | null) => {
+    const permissionFailure = threadOperationFailure(target);
+    if (permissionFailure) return permissionFailure;
+    const thread = readThreadShell(target);
+    if (!thread) return AsyncResult.success(undefined);
+    const sections = readThreadSections(target.environmentId);
+    if (section !== null && !sections.includes(section)) {
+      const saved = await saveThreadSections(target.environmentId, [...sections, section]);
+      if (saved._tag === "Failure") return saved;
+    }
+    const tagged = await setThreadTags(
+      target,
+      threadSectionTagChanges(
+        thread.source.tags,
+        [...sections, ...(section === null ? [] : [section])],
+        section,
+      ),
+    );
+    if (tagged._tag === "Failure" || section === null) return tagged;
+    // A section lists live threads, so filing one brings it out of Settled, Snoozed, and Pinned.
+    if (thread.settledOverride === "settled") {
+      const result = await unsettleThread(target);
+      if (result._tag === "Failure") return result;
+    }
+    if (thread.snoozedUntil != null) {
+      const result = await unsnoozeThread(target);
+      if (result._tag === "Failure") return result;
+    }
+    if (thread.pinnedAt != null) {
+      ThreadUndo.invalidate("pin", scopedThreadKey(target));
+      const result = await unpinThreadMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId },
+      });
+      if (result._tag === "Failure") return result;
+    }
+    announce(m(msg("Moved 1 thread to {section}", { section })));
+    return AsyncResult.success(undefined);
+  };
+
+  /** Renames a section and retags the loaded threads in it. */
+  const renameThreadSection = async (environmentId: EnvironmentId, from: string, to: string) => {
+    const sections = readThreadSections(environmentId);
+    if (from === to || !sections.includes(from) || sections.includes(to)) {
+      return AsyncResult.success(undefined);
+    }
+    const saved = await saveThreadSections(
+      environmentId,
+      sections.map((name) => (name === from ? to : name)),
+    );
+    if (saved._tag === "Failure") return saved;
+    for (const thread of readThreadShells()) {
+      if (thread.environmentId !== environmentId) continue;
+      if (threadSectionOf(thread.source.tags, sections) !== from) continue;
+      const result = await setThreadTags(scopeThreadRef(environmentId, thread.id), [
+        { tag: from, tagged: false },
+        { tag: to, tagged: true },
+      ]);
+      if (result._tag === "Failure") return result;
+    }
+    return AsyncResult.success(undefined);
+  };
+
+  /** Removes a section; its threads go back to Active and keep their tag. */
+  const deleteThreadSection = (environmentId: EnvironmentId, name: string) =>
+    saveThreadSections(
+      environmentId,
+      readThreadSections(environmentId).filter((section) => section !== name),
+    );
+
+  const moveThreadSectionBy = (environmentId: EnvironmentId, name: string, offset: -1 | 1) => {
+    const sections = [...readThreadSections(environmentId)];
+    const from = sections.indexOf(name);
+    const to = from + offset;
+    if (from === -1 || to < 0 || to >= sections.length) {
+      return Promise.resolve(AsyncResult.success(undefined));
+    }
+    [sections[from], sections[to]] = [sections[to]!, sections[from]!];
+    return saveThreadSections(environmentId, sections);
+  };
+
   const settleThread = async (target: ScopedThreadRef) => {
     if (!readEnvironmentServerConfigLoaded(target.environmentId)) {
       return AsyncResult.failure(
@@ -1061,6 +1169,10 @@ export function useThreadActions() {
     reorderActiveThread,
     markThreadUnread,
     setThreadAutoSettle,
+    moveThreadToSection,
+    renameThreadSection,
+    deleteThreadSection,
+    moveThreadSectionBy,
     turnThreadIntoProject: (target: ScopedThreadRef) =>
       createProjectFromThread({
         environmentId: target.environmentId,

@@ -2,7 +2,7 @@ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { msg, T, useGT, useMessages } from "gt-react";
 import { m } from "../i18n/messages";
 import { attachSidebarTree } from "../lib/sidebarTree";
-import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
+import { type EnvironmentId, type ScopedProjectRef, threadSectionOf } from "@t3tools/contracts";
 import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
 import {
   dropThreadContext,
@@ -11,6 +11,7 @@ import {
 } from "./chat/threadContextDrag";
 import { discardComposerDraft } from "../lib/discardComposerDraft";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import { requestThreadSectionName } from "./ThreadSectionNameDialog";
 import { useAtomValue } from "@effect/atom-react";
 import * as Option from "effect/Option";
 import { Atom } from "effect/reactivity";
@@ -284,7 +285,9 @@ import {
 } from "./sidebar/SidebarProjectFolderHeader";
 import {
   SidebarDragBoundary,
+  SidebarCustomSectionHeader,
   SidebarSectionHeader,
+  sidebarCustomSectionRowId,
   SidebarSectionPlaceholder,
 } from "./sidebar/SidebarListMarkers";
 
@@ -346,6 +349,16 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
 const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
+const COLLAPSED_THREAD_SECTIONS_KEY = "t3code:sidebar:collapsed-thread-sections";
+const NO_COLLAPSED_THREAD_SECTIONS: ReadonlyArray<string> = [];
+const CollapsedThreadSections = Schema.Array(Schema.String);
+
+type SidebarCustomSection = {
+  readonly name: string;
+  /** The environments that list this section, for its header actions. */
+  readonly environmentIds: ReadonlyArray<EnvironmentId>;
+  readonly threads: readonly EnvironmentThreadShell[];
+};
 
 const inboxReturns = createInboxReturnTracker();
 
@@ -481,6 +494,11 @@ function useSidebarThreads(input: {
     false,
     Schema.Boolean,
   );
+  const [collapsedThreadSections, setCollapsedThreadSections] = useLocalStorage(
+    COLLAPSED_THREAD_SECTIONS_KEY,
+    NO_COLLAPSED_THREAD_SECTIONS,
+    CollapsedThreadSections,
+  );
   // Shared with the old per-project sidebar, so folders keep their open state.
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const setProjectExpanded = useUiStateStore((store) => store.setProjectExpanded);
@@ -506,8 +524,25 @@ function useSidebarThreads(input: {
     clockKey: `${nowMinute}:${snoozeWakeClock}:${inboxReturnsVersion}`,
   });
 
-  const { pinnedThreads, activeThreads, workingThreads, snoozedThreads, settledThreads } =
-    partition;
+  const {
+    pinnedThreads,
+    activeThreads,
+    workingThreads,
+    snoozedThreads,
+    settledThreads,
+    customSections,
+  } = partition;
+  const visibleCustomSections = customSections.map((section) => {
+    const collapsed = collapsedThreadSections.includes(section.name);
+    return {
+      ...section,
+      collapsed,
+      visibleThreads: collapsed
+        ? routeThreadOnly(section.threads, routeRowThreadKey)
+        : section.threads,
+    };
+  });
+  const customSectionThreads = customSections.flatMap((section) => section.threads);
   // Older settled threads load in pages; the shelf lists them only as far as they are loaded.
   const olderSettledShelf = useOlderSettledShelf({
     scopes: olderSettledScopes([...serverConfigs.keys()], scopedProjectKeys),
@@ -565,6 +600,7 @@ function useSidebarThreads(input: {
     ...(projectFolders === null
       ? activeThreads
       : projectFolders.flatMap((folder) => folder.threads)),
+    ...visibleCustomSections.flatMap((section) => section.visibleThreads),
     ...visibleWorkingThreads,
     ...visibleSnoozedThreads,
     ...renderedSettledThreads,
@@ -573,6 +609,7 @@ function useSidebarThreads(input: {
   for (const [list, section] of [
     [pinnedThreads, "pinned"],
     [activeThreads, "active"],
+    [customSectionThreads, "active"],
     [workingThreads, "working"],
     [snoozedThreads, "snoozed"],
     [settledThreads, "settled"],
@@ -586,6 +623,7 @@ function useSidebarThreads(input: {
     searchableThreads: [
       ...pinnedThreads,
       ...activeThreads,
+      ...customSectionThreads,
       ...workingThreads,
       ...snoozedThreads,
       ...settledThreads,
@@ -605,6 +643,12 @@ function useSidebarThreads(input: {
     toggleSnoozedShelf: () => setSnoozedShelfExpanded((value) => !value),
     workingShelfExpanded,
     toggleWorkingShelf: () => setWorkingShelfExpanded((value) => !value),
+    visibleCustomSections,
+    customSectionThreadCount: customSectionThreads.length,
+    toggleCustomSection: (name: string) =>
+      setCollapsedThreadSections((current) =>
+        current.includes(name) ? current.filter((entry) => entry !== name) : [...current, name],
+      ),
     projectFolders,
     toggleProjectFolder: (group: SidebarProjectSnapshot) => {
       const keys = sidebarFolderExpansionKeys(group);
@@ -652,6 +696,18 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
       : active;
   const snoozed: EnvironmentThreadShell[] = [];
   const settled: EnvironmentThreadShell[] = [];
+  const customByName = new Map<
+    string,
+    { environmentIds: EnvironmentId[]; threads: EnvironmentThreadShell[] }
+  >();
+  for (const [environmentId, config] of serverConfigs) {
+    for (const name of config.settings.threadSections) {
+      const section = customByName.get(name);
+      if (section === undefined)
+        customByName.set(name, { environmentIds: [environmentId], threads: [] });
+      else section.environmentIds.push(environmentId);
+    }
+  }
   const { draggableThreadKeys, activeReorderableThreadKeys } = resolveSidebarReorderableThreadKeys({
     threads: visible,
     serverConfigs,
@@ -683,13 +739,28 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         settled: configLoaded && thread.settledOverride === "settled",
         pinned: thread.pinnedAt != null,
       });
+      const customSection =
+        section === "active"
+          ? threadSectionOf(
+              thread.source.tags,
+              serverConfigs.get(thread.environmentId)?.settings.threadSections ?? [],
+            )
+          : null;
+      const inboxList = section === "active" ? inbox(thread) : null;
+      if (customSection !== null && inboxList === active) {
+        customByName.get(customSection)?.threads.push(thread);
+        // Section rows stay put: drops cannot file into a section yet.
+        draggableThreadKeys.delete(threadKey);
+        activeReorderableThreadKeys.delete(threadKey);
+        continue;
+      }
       (section === "snoozed"
         ? snoozed
         : section === "settled"
           ? settled
           : section === "pinned"
             ? pinned
-            : inbox(thread)
+            : inboxList!
       ).push(thread);
     }
   }
@@ -726,6 +797,11 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
         firstValidTimestampMs(right.snoozedUntil ?? null),
     ),
     settledThreads: sortSettledThreads(settled),
+    customSections: [...customByName].map(([name, section]): SidebarCustomSection => ({
+      name,
+      environmentIds: section.environmentIds,
+      threads: sortThreadsForSidebar(section.threads),
+    })),
     visibleThreads: visible,
     snoozeNow: preciseNow,
   };
@@ -954,6 +1030,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     markThreadUnread,
     archiveThread,
     deleteThread,
+    renameThreadSection,
+    deleteThreadSection,
+    moveThreadSectionBy,
+    moveThreadToSection,
   } = useThreadActions();
   const updateThreadMetadata = useOrchestrationCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
@@ -1269,6 +1349,76 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (isMobile) setOpenMobile(false);
     void handleNewThread(scopeProjectRef(group.environmentId, group.id));
   });
+  const handleCustomSectionContextMenu = useStableCallback(
+    (
+      section: SidebarCustomSection,
+      names: ReadonlyArray<string>,
+      position: { x: number; y: number },
+    ) => {
+      const api = readLocalApi();
+      if (!api) return;
+      const index = names.indexOf(section.name);
+      void (async () => {
+        const clicked = await settlePromise(() =>
+          api.contextMenu.show(
+            [
+              { id: "rename", label: gt("Rename section…"), icon: "pencil" },
+              { id: "up", label: gt("Move up"), disabled: index <= 0 },
+              { id: "down", label: gt("Move down"), disabled: index === names.length - 1 },
+              {
+                id: "delete",
+                label: gt("Delete section"),
+                icon: "trash",
+                destructive: true,
+                separatorBefore: true,
+              },
+            ],
+            position,
+          ),
+        );
+        if (clicked._tag === "Failure" || clicked.value === null) return;
+        const action = clicked.value;
+        if (action === "delete") {
+          const confirmed = await settlePromise(() =>
+            api.dialogs.confirm(
+              gt('Delete section "{name}"? Its threads move back to Active.', {
+                name: section.name,
+              }),
+            ),
+          );
+          if (confirmed._tag === "Failure" || !confirmed.value) return;
+        }
+        const renamed =
+          action === "rename"
+            ? await requestThreadSectionName({
+                initialName: section.name,
+                taken: names.filter((name) => name !== section.name),
+              })
+            : null;
+        if (action === "rename" && renamed === null) return;
+        for (const environmentId of section.environmentIds) {
+          const result =
+            action === "rename"
+              ? await renameThreadSection(environmentId, section.name, renamed!)
+              : action === "delete"
+                ? await deleteThreadSection(environmentId, section.name)
+                : await moveThreadSectionBy(environmentId, section.name, action === "up" ? -1 : 1);
+          if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: gt("Failed to update section"),
+                description:
+                  thrownErrorMessage(squashAtomCommandFailure(result), m) ??
+                  gt("An error occurred."),
+              }),
+            );
+            return;
+          }
+        }
+      })();
+    },
+  );
   const handleProjectFolderContextMenu = useStableCallback(
     (
       group: SidebarProjectSnapshot,
@@ -1338,6 +1488,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     toggleSnoozedShelf,
     workingShelfExpanded,
     toggleWorkingShelf,
+    visibleCustomSections,
+    customSectionThreadCount,
+    toggleCustomSection,
     projectFolders,
     toggleProjectFolder,
     renderedSettledThreads,
@@ -1987,6 +2140,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       !hasProjectFolders &&
       pinnedThreads.length +
         activeThreads.length +
+        customSectionThreadCount +
         workingThreads.length +
         snoozedThreads.length +
         settledCount ===
@@ -2678,6 +2832,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
         const isPinned = thread.pinnedAt != null;
+        const sectionNames = serverConfigs.get(thread.environmentId)?.settings.threadSections ?? [];
         const snoozePresets = resolveSnoozePresets(
           new Date(),
           timestampFormat,
@@ -2720,6 +2875,18 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
               canRename: !fromSearch,
+              ...(configLoaded
+                ? {
+                    sections: {
+                      names: sectionNames,
+                      // Pinned, Snoozed, and Settled outrank a section, so it is not where the thread is.
+                      current:
+                        isPinned || isSnoozed || isSettled
+                          ? null
+                          : threadSectionOf(thread.source.tags, sectionNames),
+                    },
+                  }
+                : {}),
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,
@@ -2746,6 +2913,28 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   thread.environmentId,
                 );
           if (preset) attemptSnooze(threadRef, preset);
+          return;
+        }
+        if (clicked.value.startsWith("section:")) {
+          const section =
+            clicked.value === "section:none"
+              ? null
+              : clicked.value === "section:new"
+                ? await requestThreadSectionName({ taken: sectionNames })
+                : (sectionNames[Number(clicked.value.slice("section:".length))] ?? null);
+          if (section === null && clicked.value !== "section:none") return;
+          const result = await moveThreadToSection(threadRef, section);
+          if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: gt("Failed to move thread"),
+                description:
+                  thrownErrorMessage(squashAtomCommandFailure(result), m) ??
+                  gt("An error occurred."),
+              }),
+            );
+          }
           return;
         }
         switch (clicked.value) {
@@ -3400,6 +3589,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           visibleDraftSessionCount === 0 &&
           pinnedThreads.length +
             activeThreads.length +
+            customSectionThreadCount +
             workingThreads.length +
             snoozedThreads.length ===
             0 &&
@@ -3485,6 +3675,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                         section: SidebarSection,
                         // The tree row of the project folder this row sits in.
                         folderRow?: string,
+                        // The tree row of the custom section this row sits in.
+                        sectionRow?: string,
                       ) => {
                         const threadKey = scopedThreadKey(
                           scopeThreadRef(thread.environmentId, thread.id),
@@ -3512,6 +3704,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                             variant={rowVariant}
                             navigationParent={
                               folderRow ??
+                              sectionRow ??
                               (section === "working" ||
                               section === "snoozed" ||
                               section === "settled"
@@ -3756,37 +3949,64 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                             break;
                         }
                       }
+                      if (settledShelfExpanded && hiddenSettledCount > 0) {
+                        items.push(
+                          <li key="settled-more" className="list-none">
+                            <button
+                              type="button"
+                              data-sidebar-row="settled:more"
+                              data-sidebar-parent="shelf:settled"
+                              aria-disabled={olderSettledShelf.loading}
+                              onClick={() => {
+                                if (olderSettledShelf.loading) return;
+                                olderSettledShelf.retry();
+                                showMoreSettled();
+                              }}
+                              className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground aria-disabled:cursor-default"
+                            >
+                              {/* Plus means "add", so revealing more uses a chevron. */}
+                              <ChevronDownIcon aria-hidden className="size-4 shrink-0" />
+                              {olderSettledShelf.loading
+                                ? gt("Loading")
+                                : olderSettledShelf.failed
+                                  ? gt("Could not load older threads. Retry")
+                                  : gt(
+                                      "{count, plural, one {Show {count} more} other {Show {count} more}}",
+                                      {
+                                        count: Math.min(
+                                          hiddenSettledCount,
+                                          SETTLED_TAIL_PAGE_COUNT,
+                                        ),
+                                      },
+                                    )}
+                            </button>
+                          </li>,
+                        );
+                      }
+                      for (const section of visibleCustomSections) {
+                        const sectionRow = sidebarCustomSectionRowId(section.name);
+                        items.push(
+                          <SidebarCustomSectionHeader
+                            key={`thread-section:${section.name}`}
+                            name={section.name}
+                            count={section.threads.length}
+                            expanded={!section.collapsed}
+                            onToggle={() => toggleCustomSection(section.name)}
+                            onContextMenu={(position) =>
+                              handleCustomSectionContextMenu(
+                                section,
+                                visibleCustomSections.map((entry) => entry.name),
+                                position,
+                              )
+                            }
+                          />,
+                        );
+                        for (const thread of section.visibleThreads) {
+                          items.push(renderThreadRow(thread, "active", undefined, sectionRow));
+                        }
+                      }
                       return items;
                     })()}
-                    {settledShelfExpanded && hiddenSettledCount > 0 ? (
-                      <li className="list-none">
-                        <button
-                          type="button"
-                          data-sidebar-row="settled:more"
-                          data-sidebar-parent="shelf:settled"
-                          aria-disabled={olderSettledShelf.loading}
-                          onClick={() => {
-                            if (olderSettledShelf.loading) return;
-                            olderSettledShelf.retry();
-                            showMoreSettled();
-                          }}
-                          className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground aria-disabled:cursor-default"
-                        >
-                          {/* Plus means "add", so revealing more uses a chevron. */}
-                          <ChevronDownIcon aria-hidden className="size-4 shrink-0" />
-                          {olderSettledShelf.loading
-                            ? gt("Loading")
-                            : olderSettledShelf.failed
-                              ? gt("Could not load older threads. Retry")
-                              : gt(
-                                  "{count, plural, one {Show {count} more} other {Show {count} more}}",
-                                  {
-                                    count: Math.min(hiddenSettledCount, SETTLED_TAIL_PAGE_COUNT),
-                                  },
-                                )}
-                        </button>
-                      </li>
-                    ) : null}
                   </ul>
                 </SortableContext>
               </DndContext>

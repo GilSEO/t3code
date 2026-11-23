@@ -105,6 +105,7 @@ export interface ServerUpdateTarget {
 }
 
 const IDLE_SERVER_UPDATE_STATE: ServerUpdateState = { status: "idle" };
+const NO_THREAD_SECTIONS: ReadonlyArray<string> = [];
 const EMPTY_SERVER_UPDATE_STATE_ATOM = Atom.make<ServerUpdateState>(IDLE_SERVER_UPDATE_STATE).pipe(
   Atom.withLabel("environment-data:server:update-state:empty"),
 );
@@ -1372,6 +1373,18 @@ export function createServerEnvironmentAtoms<R, E>(
       Atom.withLabel(`environment-data:server:hidden-thread-tags:${environmentId}`),
     ),
   );
+  const threadSectionsAtom = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make(
+      (get): ReadonlyArray<string> =>
+        get(settingsValueAtom(environmentId))?.threadSections ?? NO_THREAD_SECTIONS,
+    ).pipe(
+      Atom.withEquality(
+        (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
+          a === b || (a.length === b.length && a.every((name, index) => name === b[index])),
+      ),
+      Atom.withLabel(`environment-data:server:thread-sections:${environmentId}`),
+    ),
+  );
   const usagePricesAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => {
       const overrides = get(settingsValueAtom(environmentId))?.usagePriceOverrides ?? {};
@@ -1530,6 +1543,7 @@ export function createServerEnvironmentAtoms<R, E>(
     updateStateAtom,
     settingsValueAtom,
     hiddenThreadTagsAtom,
+    threadSectionsAtom,
     usageModelFilterAtom,
     providersValueAtom,
     providerAuthState: createEnvironmentRpcSubscriptionAtomFamily(runtime, {

@@ -1,6 +1,7 @@
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { requestCustomSnooze } from "../components/CustomSnoozeDialog";
+import { requestThreadSectionName } from "../components/ThreadSectionNameDialog";
 import { openGuestShareDialog } from "../components/chat/guestShareDialogState";
 import {
   type AtomCommandResult,
@@ -13,6 +14,7 @@ import {
   AuthOrchestrationOperateScope,
   type ScopedThreadRef,
   type ThreadId,
+  threadSectionOf,
 } from "@t3tools/contracts";
 import { useRouter } from "@tanstack/react-router";
 import { msg } from "gt-react";
@@ -34,6 +36,7 @@ import { readEnvironmentScope } from "../state/session";
 import {
   readEnvironmentServerConfigLoaded,
   readEnvironmentSupportsAutoSettleOptOut,
+  readThreadSections,
   readThreadShell,
   useProjects,
 } from "../state/entities";
@@ -90,6 +93,7 @@ export function useThreadActionMenu(input: {
     archiveThread,
     deleteThread,
     markThreadUnread,
+    moveThreadToSection,
     turnThreadIntoProject,
   } = useThreadActions();
   const regenerateThreadTitle = useOrchestrationCommand(threadEnvironment.regenerateTitle, {
@@ -136,6 +140,7 @@ export function useThreadActionMenu(input: {
         pinning: configLoaded,
         titleRegeneration: configLoaded,
       };
+      const sectionNames = readThreadSections(threadRef.environmentId);
       const isRegeneratingTitle = thread.titleRegeneration != null;
       const snoozePresets = resolveSnoozePresets(now, timestampFormat, threadRef.environmentId);
       const items = buildThreadActionMenuItems({
@@ -155,6 +160,20 @@ export function useThreadActionMenu(input: {
         snoozePresets,
         canShareWithGuest,
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+        ...(configLoaded
+          ? {
+              sections: {
+                names: sectionNames,
+                // Pinned, Snoozed, and Settled outrank a section, so it is not where the thread is.
+                current:
+                  thread.pinnedAt != null ||
+                  thread.settledOverride === "settled" ||
+                  effectiveSnoozed(thread, { now: now.toISOString() })
+                    ? null
+                    : threadSectionOf(thread.source.tags, sectionNames),
+              },
+            }
+          : {}),
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
       if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -183,6 +202,20 @@ export function useThreadActionMenu(input: {
         const result = await snoozeThread(threadRef, preset.snoozedUntil);
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           failureToast(m(msg("Failed to snooze thread")), squashAtomCommandFailure(result));
+        }
+        return;
+      }
+      if (action.startsWith("section:")) {
+        const section =
+          action === "section:none"
+            ? null
+            : action === "section:new"
+              ? await requestThreadSectionName({ taken: sectionNames })
+              : (sectionNames[Number(action.slice("section:".length))] ?? null);
+        if (section === null && action !== "section:none") return;
+        const result = await moveThreadToSection(threadRef, section);
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          failureToast(m(msg("Failed to move thread")), squashAtomCommandFailure(result));
         }
         return;
       }

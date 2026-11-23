@@ -20,6 +20,10 @@ export type ThreadActionMenuId =
   | "snooze"
   | `snooze:${string}`
   | "unsnooze"
+  | "section"
+  | `section:${number}`
+  | "section:new"
+  | "section:none"
   | "rename"
   | "regenerate-title"
   | "mark-unread"
@@ -125,6 +129,11 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  /** The environment's sidebar sections and the one this thread is in; absent hides the submenu. */
+  readonly sections?: {
+    readonly names: ReadonlyArray<string>;
+    readonly current: string | null;
+  };
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
@@ -200,6 +209,35 @@ export function buildThreadActionMenuItems(
                   },
                 ],
               },
+        ]
+      : []),
+    ...(state.sections
+      ? [
+          {
+            id: "section" as const,
+            label: resolve(msg("Move to section")),
+            icon: "folder-input",
+            children: [
+              ...state.sections.names.map((name, index) => ({
+                id: `section:${index}` as const,
+                label: name,
+                checked: name === state.sections?.current,
+              })),
+              {
+                id: "section:new" as const,
+                label: resolve(msg("New section…")),
+                separatorBefore: state.sections.names.length > 0,
+              },
+              ...(state.sections.current === null
+                ? []
+                : [
+                    {
+                      id: "section:none" as const,
+                      label: resolve(msg("Remove from section")),
+                    },
+                  ]),
+            ],
+          },
         ]
       : []),
     {

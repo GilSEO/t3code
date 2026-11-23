@@ -34,7 +34,7 @@ import { Atom } from "effect/reactivity";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentProjects } from "./projects";
 import { environmentPresentations } from "./presentation";
-import { environmentServerConfigsAtom } from "./server";
+import { environmentServerConfigsAtom, serverEnvironment } from "./server";
 import {
   allEnvironmentProjectSnapshotsReadyAtom,
   allEnvironmentShellsBootstrappedAtom,
@@ -373,6 +373,11 @@ export function readEnvironmentSupportsServerBrowser(environmentId: EnvironmentI
     appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
       .serverBrowser === true
   );
+}
+
+/** The environment's sidebar section names, in display order. */
+export function readThreadSections(environmentId: EnvironmentId): ReadonlyArray<string> {
+  return appAtomRegistry.get(serverEnvironment.threadSectionsAtom(environmentId));
 }
 
 export function readEnvironmentServerConfigLoaded(environmentId: EnvironmentId): boolean {

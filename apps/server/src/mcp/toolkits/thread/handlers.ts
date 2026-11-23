@@ -6,6 +6,8 @@ import {
   type RunId,
   OrchestratorMcpFailure,
   type OrchestrationV2Command,
+  threadSectionOf,
+  threadSectionTagChanges,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
@@ -24,6 +26,7 @@ import type * as ThreadManagement from "../../../orchestration-v2/ThreadManageme
 import * as ThreadMessageIntake from "../../../orchestration-v2/ThreadMessageIntake.ts";
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
 
@@ -65,6 +68,66 @@ const topOfPinnedRunKey = Effect.fn("mcp.topOfPinnedRunKey")(function* (
   if (index === null) return undefined;
   const pinnedKeys = index.flatMap((entry) => (entry.pinnedAt == null ? [] : [entry.pinOrderKey]));
   return topOfPinnedRunOrderKey(pinnedKeys) ?? undefined;
+});
+
+/**
+ * Files a thread in a sidebar section as the client does: the section's tag alone, and out of
+ * Settled, Snoozed, and Pinned so it shows there. An unknown name is added to the section list.
+ */
+const moveThreadToSection = Effect.fn("mcp.moveThreadToSection")(function* (
+  threadId: ThreadId | undefined,
+  section: string | null,
+) {
+  const { threads, projection } = yield* readThread(threadId);
+  const thread = projection.thread;
+  const settings = yield* ServerSettings.ServerSettingsService;
+  let sections = (yield* settings.getSettings.pipe(Effect.mapError(unavailable))).threadSections;
+  if (section === null && threadSectionOf(thread.tags, sections) === null) {
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "The thread is not in a section.",
+    });
+  }
+  if (section !== null && !sections.includes(section)) {
+    sections = (yield* settings
+      .updateSettings({ threadSections: [...sections, section] })
+      .pipe(Effect.mapError(unavailable))).threadSections;
+  }
+  const commands: Array<
+    (common: { commandId: CommandId; threadId: ThreadId }) => OrchestrationV2Command
+  > = threadSectionTagChanges(thread.tags, sections, section).map((change) => (common) => ({
+    ...common,
+    type: "thread.tag.set",
+    ...change,
+  }));
+  if (section !== null) {
+    // Tagging is idempotent, so a thread already in the section still reports a sequence.
+    if (commands.length === 0) {
+      commands.push((common) => ({
+        ...common,
+        type: "thread.tag.set",
+        tag: section,
+        tagged: true,
+      }));
+    }
+    if (thread.settledOverride === "settled") {
+      commands.push((common) => ({ ...common, type: "thread.unsettle", reason: "user" }));
+    }
+    if (thread.snoozedUntil != null) {
+      commands.push((common) => ({ ...common, type: "thread.unsnooze", reason: "user" }));
+    }
+    if (thread.pinnedAt != null) {
+      commands.push((common) => ({ ...common, type: "thread.unpin" }));
+    }
+  }
+  let sequence = 0;
+  for (const command of commands) {
+    const result = yield* threads
+      .dispatch(command({ commandId: yield* newCommandId(), threadId: thread.id }))
+      .pipe(Effect.mapError(dispatchFailure));
+    sequence = result.sequence;
+  }
+  return { sequence };
 });
 
 const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
@@ -402,6 +465,15 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
   ),
   t3_thread_organize: writesThread((input) =>
     Effect.gen(function* () {
+      if (input.action === "move_to_section") {
+        if (input.section === undefined) {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "move_to_section requires section.",
+          });
+        }
+        return yield* moveThreadToSection(input.threadId, input.section);
+      }
       const { threads, projection, caller } = yield* readThread(input.threadId);
       const common = { commandId: yield* newCommandId(), threadId: projection.thread.id };
       if (input.action === "settle") {

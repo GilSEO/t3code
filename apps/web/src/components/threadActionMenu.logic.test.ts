@@ -89,3 +89,35 @@ describe("buildThreadActionMenuItems", () => {
     expect(items.filter((item) => item.disabled).map((item) => item.id)).toEqual(["rename"]);
   });
 });
+
+describe("buildThreadActionMenuItems sections", () => {
+  const sectionMenu = (current: string | null, canOperate = true) =>
+    buildThreadActionMenuItems({
+      ...baseState,
+      canOperate,
+      sections: { names: ["Review", "Awaiting deployment"], current },
+    }).find((item) => item.id === "section");
+
+  it("lists sections by index, checks the current one, and offers a way out", () => {
+    const menu = sectionMenu("Awaiting deployment");
+    expect(menu?.children?.map((child) => [child.id, child.label, child.checked])).toEqual([
+      ["section:0", "Review", false],
+      ["section:1", "Awaiting deployment", true],
+      ["section:new", "New section…", undefined],
+      ["section:none", "Remove from section", undefined],
+    ]);
+  });
+
+  it("offers no way out for a thread outside every section", () => {
+    expect(sectionMenu(null)?.children?.map((child) => child.id)).toEqual([
+      "section:0",
+      "section:1",
+      "section:new",
+    ]);
+  });
+
+  it("is hidden without section support and disabled without permission", () => {
+    expect(buildThreadActionMenuItems(baseState).some((item) => item.id === "section")).toBe(false);
+    expect(sectionMenu(null, false)?.disabled).toBe(true);
+  });
+});

@@ -145,3 +145,37 @@ export function SidebarSectionHeader(props: {
     </SortableSidebarMarker>
   );
 }
+
+/** A user's own section, drawn outside the sortable list: rows cannot be dropped into it yet. */
+export function SidebarCustomSectionHeader(props: {
+  name: string;
+  count: number;
+  expanded: boolean;
+  onToggle: () => void;
+  onContextMenu: (position: { x: number; y: number }) => void;
+}) {
+  return (
+    <li
+      data-thread-selection-safe
+      data-testid="sidebar-thread-section-header"
+      className="relative mx-0.5 h-8 list-none"
+    >
+      <CollapsibleSectionHeader
+        data-sidebar-row={sidebarCustomSectionRowId(props.name)}
+        onClick={props.onToggle}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          props.onContextMenu({ x: event.clientX, y: event.clientY });
+        }}
+        expanded={props.expanded}
+        accessory={<span className="font-normal tabular-nums">{props.count}</span>}
+      >
+        {props.name}
+      </CollapsibleSectionHeader>
+    </li>
+  );
+}
+
+export function sidebarCustomSectionRowId(name: string): string {
+  return `section:${name}`;
+}
